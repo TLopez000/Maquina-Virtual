@@ -2,6 +2,7 @@
 #include "../cabeceras/operaciones.h"
 #include "../cabeceras/instrucciones.h"
 #include "../cabeceras/memoria.h"
+#include "../cabeceras/llamadas_sistema.h"
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -19,7 +20,7 @@ void inicializarMaquina(MaquinaVirtual *maquina) {
         maquina->registros[i] = 0;
     }
     for (i = 0; i < CANT_SEGMENTOS; i++) {
-        maquina->segmentos[i].base = -1;
+        maquina->segmentos[i].base = 0;
         maquina->segmentos[i].tamanio = 0;
     }
     for (i = 0; i < CANT_OPERACIONES; i++) {
@@ -68,10 +69,12 @@ void cicloPrincipal(MaquinaVirtual *maquina) {
     int desplazamiento;
     uint32_t direccionFisica;
     uint8_t instruccion;
+
     // IP esta inicializado en cargador.c
     
-    uint32_t base = maquina->segmentos[2].base;
-    uint32_t limiteCS = maquina->segmentos[2].tamanio + base;
+    uint32_t indiceCS = (uint32_t)maquina->registros[CS] >> 16;
+    uint32_t base = maquina->segmentos[indiceCS].base;
+    uint32_t limiteCS = maquina->segmentos[indiceCS].tamanio + base;
 
     direccionFisica = calculaDirFisica(maquina, maquina->registros[IP]);
 
@@ -90,8 +93,11 @@ void cicloPrincipal(MaquinaVirtual *maquina) {
 
         maquina->Operaciones[maquina->registros[OPC]](maquina);
 
+        if (maquina->pasoAPaso)
+            breakpoint(maquina);
+
         // STOP o RET de main pueden dejar IP en -1.
-        if (maquina->registros[IP] == -1) {
+        if (maquina->detenerEjecucion || maquina->registros[IP] == -1) {
             break;
         }
 
@@ -99,6 +105,6 @@ void cicloPrincipal(MaquinaVirtual *maquina) {
 
     }
 
-    printf("Fin de la ejecución\n");
+    printf("\nFin de la ejecución\n");
 
 }

@@ -4,6 +4,38 @@
 #include "../cabeceras/memoria.h"
 #include "../cabeceras/llamadas_sistema.h"
 
+static uint32_t sectorRegistro(uint8_t opregistro, int *desplazamiento){
+    uint8_t sector = (opregistro >> 5) & 0x03;
+    switch (sector) 
+    {
+    case 0: *desplazamiento = 0; return 0xFFFFFFFF; //EAX
+    case 1: *desplazamiento = 0; return 0x000000FF; //AL
+    case 2: *desplazamiento = 8; return 0x0000FF00; //AH
+    case 3: *desplazamiento = 0; return 0x0000FFFF; //AX
+    default: *desplazamiento = 0 ; return 0xFFFFFFFF;
+    }   
+}
+
+static void verificaUnderflow(MaquinaVirtual *maquina, uint32_t bytesAAcceder) {
+    uint32_t indiceSS = (uint32_t)maquina->registros[SS] >> 16;
+    uint32_t tamanioSS = maquina->segmentos[indiceSS].tamanio;
+    uint32_t offsetSP = (uint32_t)maquina->registros[SP] & 0xFFFF;
+
+    if (offsetSP > tamanioSS || tamanioSS - offsetSP < bytesAAcceder) {
+        printf("Error: STACK UNDERFLOW\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+static void verificaOverflow(MaquinaVirtual *maquina, uint32_t bytesAAcceder) {
+    uint32_t offsetSP = (uint32_t)maquina->registros[SP] & 0xFFFF;
+
+    if (offsetSP < bytesAAcceder) {
+        printf("Error: STACK OVERFLOW\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
 static uint32_t obtenerValor(MaquinaVirtual *maquina, Operando op)
 {
     uint8_t tipo = op >> 24;
@@ -12,8 +44,23 @@ static uint32_t obtenerValor(MaquinaVirtual *maquina, Operando op)
     {
         case REGISTRO:
         {
-            uint8_t nroregistro = op & 0x1F;
-            return maquina->registros[nroregistro];
+            uint8_t descriptor = (uint8_t) op;
+            uint8_t nroregistro = descriptor & 0x1F;
+            uint8_t sector = (descriptor >> 5) & 0x03;
+            
+            int desplazamiento;
+            uint32_t mascara = sectorRegistro(op, &desplazamiento);
+            
+            uint32_t valor = ((uint32_t)maquina->registros[nroregistro] & mascara) >> desplazamiento;
+
+            // AL o AH: interpreta los 8 bits con signo
+            if (sector == 1 || sector == 2)
+                return (uint32_t)(int32_t)(int8_t)valor;
+            // AX: interpretar los 16 bits con signo.
+            if (sector == 3)
+                return (uint32_t)(int32_t)(int16_t)valor;
+            // Registro completo.
+            return valor;
         }
 
         case INMEDIATO:
@@ -26,7 +73,7 @@ static uint32_t obtenerValor(MaquinaVirtual *maquina, Operando op)
         {
             int16_t offset = (op >> 8) & 0xFFFF;
             uint8_t registro = op & 0x1F;
-            uint16_t bytesAleer = sizeof(uint32_t); // 4 bytes a leer
+            uint16_t bytesAleer = ((uint8_t) op) >> 5;
             uint32_t direccionLogica = maquina->registros[registro] + offset; //direccion donde apunta el registro + el desplazamiento
 
             maquina->registros[MAR] = bytesAleer << 16;
@@ -34,7 +81,15 @@ static uint32_t obtenerValor(MaquinaVirtual *maquina, Operando op)
 
             leerMemoria(maquina);
 
-            return maquina->registros[MBR];
+            uint32_t valor = (uint32_t)maquina->registros[MBR];
+
+            if (bytesAleer == 1)
+                return (uint32_t)(int32_t)(int8_t)valor;
+            
+            if (bytesAleer == 2)
+                return (uint32_t)(int32_t)(int16_t)valor;
+            
+            return valor;
         }
 
         default:
@@ -44,14 +99,26 @@ static uint32_t obtenerValor(MaquinaVirtual *maquina, Operando op)
 
 static void escribirValor(MaquinaVirtual *maquina, Operando op, int32_t valor)
 { 
-    uint32_t tipo = op >> 24;
+    uint8_t tipo = op >> 24;
 
     switch (tipo)
     {
         case REGISTRO:
         {
-            uint8_t nroregistro = op & 0x1F;
-            maquina->registros[nroregistro] = valor;
+            uint8_t descriptor = (uint8_t)op;
+            uint8_t nroregistro = descriptor & 0x1F;
+            
+            int desplazamiento;
+            uint32_t mascara = sectorRegistro(op, &desplazamiento);
+            
+            uint32_t valorAnterior = (uint32_t)maquina->registros[nroregistro];
+
+            // Borra solamente la parte que vamos a reemplazar.
+            uint32_t conservado = valorAnterior & ~mascara;
+            // Coloca el valor en su posicion y recorta los bits sobrantes.
+            uint32_t nuevo = ((uint32_t)valor << desplazamiento) & mascara;
+            
+            maquina->registros[nroregistro] = (int32_t) (conservado | nuevo);
             break;
         }
 
@@ -59,7 +126,7 @@ static void escribirValor(MaquinaVirtual *maquina, Operando op, int32_t valor)
         {
             int16_t offset = (op >> 8) & 0xFFFF;
             uint8_t registro = op & 0x1F;
-            uint16_t bytesAescribir = sizeof(uint32_t); // 4 bytes a escribir
+            uint16_t bytesAescribir = ((uint8_t) op) >> 5;
 
             uint32_t direccionLogica = maquina->registros[registro] + offset;
 
@@ -102,6 +169,16 @@ static void actualizarCC(MaquinaVirtual *maquina, uint64_t resultado64, int32_t 
         maquina->registros[CC] &= ~0x10000000;
     }
 
+}
+
+static uint32_t obtenerDestinoSalto(MaquinaVirtual *maquina, Operando operando) {
+    uint32_t destino = obtenerValor(maquina, operando);
+
+    if ((operando >> 24) == INMEDIATO)
+        destino = ((uint32_t)maquina->registros[CS] & 0xFFFF0000) |
+                  (destino & 0xFFFF);
+
+    return destino;
 }
 
 // OP1 = Operando A
@@ -346,16 +423,17 @@ void operacionSYS(MaquinaVirtual *maquina)
             escribirDatos(maquina);
             break;
         case CLEAR:
-
+            limpiarPantalla();
             break;
         case STRING_READ:
-
+            leerString(maquina);
             break;
         case STRING_WRITE:
-        
+            escribirString(maquina);
             break;
         case BREAKPOINT:
-
+            if (maquina->rutaImagen != NULL)
+                maquina->pasoAPaso = 1;
             break;
         default:
             // printf("Error: llamada al sistema desconocida");
@@ -365,14 +443,14 @@ void operacionSYS(MaquinaVirtual *maquina)
 
 void operacionJMP(MaquinaVirtual *maquina)
 {
-    uint32_t valor = obtenerValor(maquina, maquina->registros[OP1]);
+    uint32_t valor = obtenerDestinoSalto(maquina, maquina->registros[OP1]);
 
     maquina->registros[IP] = valor;
 }
 
 void operacionJP(MaquinaVirtual *maquina)
 {
-    uint32_t valor = obtenerValor(maquina, maquina->registros[OP1]);
+    uint32_t valor = obtenerDestinoSalto(maquina, maquina->registros[OP1]);
 
     if (!(maquina->registros[CC] & 0xC0000000)) // si el bit N == 0 y el bit Z == 0
         maquina->registros[IP] = valor;
@@ -380,7 +458,7 @@ void operacionJP(MaquinaVirtual *maquina)
 
 void operacionJN(MaquinaVirtual *maquina)
 {
-    uint32_t valor = obtenerValor(maquina, maquina->registros[OP1]);
+    uint32_t valor = obtenerDestinoSalto(maquina, maquina->registros[OP1]);
 
     if (maquina->registros[CC] & 0x80000000) // si el bit N == 1 
         maquina->registros[IP] = valor;
@@ -388,7 +466,7 @@ void operacionJN(MaquinaVirtual *maquina)
 
 void operacionJZ(MaquinaVirtual *maquina)
 {
-    uint32_t valor = obtenerValor(maquina, maquina->registros[OP1]);
+    uint32_t valor = obtenerDestinoSalto(maquina, maquina->registros[OP1]);
 
     if (maquina->registros[CC] & 0x40000000) // si el bit Z == 1 
         maquina->registros[IP] = valor;
@@ -396,7 +474,7 @@ void operacionJZ(MaquinaVirtual *maquina)
 
 void operacionJC(MaquinaVirtual *maquina)
 {
-    uint32_t valor = obtenerValor(maquina, maquina->registros[OP1]);
+    uint32_t valor = obtenerDestinoSalto(maquina, maquina->registros[OP1]);
 
     if (maquina->registros[CC] & 0x20000000) // si el bit C == 1 
         maquina->registros[IP] = valor;
@@ -404,7 +482,7 @@ void operacionJC(MaquinaVirtual *maquina)
 
 void operacionJV(MaquinaVirtual *maquina)
 {
-    uint32_t valor = obtenerValor(maquina, maquina->registros[OP1]);
+    uint32_t valor = obtenerDestinoSalto(maquina, maquina->registros[OP1]);
 
     if (maquina->registros[CC] & 0x10000000) // si el bit V == 1 
         maquina->registros[IP] = valor;
@@ -412,7 +490,7 @@ void operacionJV(MaquinaVirtual *maquina)
 
 void operacionJNP(MaquinaVirtual *maquina)
 {
-    uint32_t valor = obtenerValor(maquina, maquina->registros[OP1]);
+    uint32_t valor = obtenerDestinoSalto(maquina, maquina->registros[OP1]);
 
     if (maquina->registros[CC] & 0xC0000000) // si el bit N == 1 o el bit Z == 1
         maquina->registros[IP] = valor;
@@ -420,7 +498,7 @@ void operacionJNP(MaquinaVirtual *maquina)
 
 void operacionJNN(MaquinaVirtual *maquina)
 {
-    uint32_t valor = obtenerValor(maquina, maquina->registros[OP1]);
+    uint32_t valor = obtenerDestinoSalto(maquina, maquina->registros[OP1]);
 
     if (!(maquina->registros[CC] & 0x80000000)) // si el bit N == 0
         maquina->registros[IP] = valor;
@@ -428,7 +506,7 @@ void operacionJNN(MaquinaVirtual *maquina)
 
 void operacionJNZ(MaquinaVirtual *maquina)
 {
-    uint32_t valor = obtenerValor(maquina, maquina->registros[OP1]);
+    uint32_t valor = obtenerDestinoSalto(maquina, maquina->registros[OP1]);
 
     if (!(maquina->registros[CC] & 0x40000000)) // si el bit Z == 0
         maquina->registros[IP] = valor;
@@ -446,14 +524,7 @@ void operacionNOT(MaquinaVirtual *maquina)
 
 void operacionPUSH(MaquinaVirtual *maquina)
 {
-    uint32_t indiceSS = (uint32_t)maquina->registros[SS] >> 16;
-    uint32_t tamanioSS = maquina->segmentos[indiceSS].tamanio;
-    uint32_t offsetSP = (uint32_t)maquina->registros[SP] & 0xFFFF;
-
-    if (offsetSP < 4) {
-        printf("Error: STACK OVERFLOW\n");
-        exit(EXIT_FAILURE);
-    }
+    verificaOverflow(maquina, 4); // Verifico que haya espacio en la pila para guardar el valor
 
     maquina->registros[SP] -= 4;
     uint32_t valor = obtenerValor(maquina, maquina->registros[OP1]);
@@ -466,14 +537,8 @@ void operacionPUSH(MaquinaVirtual *maquina)
 
 void operacionPOP(MaquinaVirtual *maquina)
 {
-    uint32_t indiceSS = (uint32_t)maquina->registros[SS] >> 16;
-    uint32_t tamanioSS = maquina->segmentos[indiceSS].tamanio;
-    uint32_t offsetSP = (uint32_t)maquina->registros[SP] & 0xFFFF;
-
-    if (tamanioSS - offsetSP < 4) {
-        printf("Error: STACK UNDERFLOW\n");
-        exit(EXIT_FAILURE);
-    }
+    
+    verificaUnderflow(maquina, 4); // Verifico que haya al menos 4 bytes en la pila para leer el valor
 
     maquina->registros[LAR] = maquina->registros[SP];
     maquina->registros[MAR] = 4 << 16;
@@ -487,14 +552,7 @@ void operacionPOP(MaquinaVirtual *maquina)
 
 void operacionCALL(MaquinaVirtual *maquina)
 {
-    uint32_t indiceSS = (uint32_t)maquina->registros[SS] >> 16;
-    uint32_t tamanioSS = maquina->segmentos[indiceSS].tamanio;
-    uint32_t offsetSP = (uint32_t)maquina->registros[SP] & 0xFFFF;
-
-    if (offsetSP < 4) {
-        printf("Error: STACK OVERFLOW\n");
-        exit(EXIT_FAILURE);
-    }
+    verificaOverflow(maquina, 4); // Verifico que haya espacio en la pila para guardar la dirección de retorno
 
     maquina->registros[SP] -= 4;
 
@@ -505,21 +563,15 @@ void operacionCALL(MaquinaVirtual *maquina)
     escribirMemoria(maquina);
 
     // Salto a la dirección de destino
-    uint32_t valor = obtenerValor(maquina, maquina->registros[OP1]);
+    uint32_t valor = obtenerDestinoSalto(maquina, maquina->registros[OP1]);
     maquina->registros[IP] = (uint32_t)maquina->registros[CS] + (valor & 0xFFFF); // consultar si el traductor da solo el offset o da la direccion logica completa
 }
 
 void operacionRET(MaquinaVirtual *maquina)
 {
-    uint32_t indiceSS = (uint32_t)maquina->registros[SS] >> 16;
-    uint32_t tamanioSS = maquina->segmentos[indiceSS].tamanio;
-    uint32_t offsetSP = (uint32_t)maquina->registros[SP] & 0xFFFF;
 
-    if (tamanioSS - offsetSP < 4) {
-        printf("Error: STACK UNDERFLOW\n");
-        exit(EXIT_FAILURE);
-    }
-
+    verificaUnderflow(maquina, 4); // Verifico que haya al menos 4 bytes en la pila para leer la dirección de retorno
+  
     // Recupero la dirección de retorno desde la pila
     maquina->registros[LAR] = maquina->registros[SP];
     maquina->registros[MAR] = 4 << 16;
